@@ -1,6 +1,7 @@
 import os
 import json
 import datetime
+from datetime import timezone, timedelta
 import requests
 import gspread
 from google.oauth2 import service_account
@@ -142,6 +143,17 @@ def main():
     if not sheet_id:
         raise ValueError("SHEET_ID environment variable is not set.")
 
+    # Evaluate in IST (UTC+5:30)
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.datetime.now(ist)
+
+    # The Morning Alarm
+    if now_ist.hour == 9:
+        print("Morning Alarm: Sending morning broadcast to Slack.")
+        message = "🌅 Good morning team! Please make sure your tasks for today are logged in the master sheet."
+        send_slack_notification(None, message, slack_bot_token)
+        return
+
     # Authenticate and build services
     print("Authenticating with Google APIs...")
     creds = get_credentials()
@@ -152,58 +164,51 @@ def main():
     # Using the first sheet tab
     sh = gc.open_by_key(sheet_id).sheet1
     
-    # Retrieve all spreadsheet values
-    rows = sh.get_all_values()
-    if len(rows) <= 1:
+    # Retrieve all spreadsheet records
+    records = sh.get_all_records()
+    if not records:
         print("No tasks found in the sheet.")
         return
 
-    # Normalize header formatting
-    headers = [h.strip() for h in rows[0]]
+    # Find the actual dictionary key for each required column dynamically
+    sample_keys = list(records[0].keys())
     required_cols = ["Task Name", "Task Type", "Assignee Name", "Priority", "Due Date", "Status", "Slack ID"]
-    
-    col_indices = {}
+    key_mapping = {}
     for req in required_cols:
         match = None
-        # Exact match
-        for idx, h in enumerate(headers):
-            if h.lower() == req.lower():
-                match = idx + 1
+        for k in sample_keys:
+            if k.strip().lower() == req.lower():
+                match = k
                 break
-        # Substring match fallback
         if not match:
-            for idx, h in enumerate(headers):
-                if req.lower() in h.lower():
-                    match = idx + 1
+            for k in sample_keys:
+                if req.lower() in k.strip().lower():
+                    match = k
                     break
         if not match:
-            raise ValueError(f"Required column '{req}' could not be matched in spreadsheet headers: {headers}")
-        col_indices[req] = match
+            raise ValueError(f"Required column '{req}' could not be matched in spreadsheet keys: {sample_keys}")
+        key_mapping[req] = match
 
-    today = datetime.date.today()
+    completion_alert_key = sample_keys[8] if len(sample_keys) >= 9 else None
+
+    today = now_ist.date()
     today_str = today.strftime("%Y-%m-%d")
-    tomorrow_str = (today + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     
-    print(f"Processing tasks for today's date: {today_str}")
+    print(f"Processing tasks for today's date (IST): {today_str}")
 
-    # Iterate through each row (skip header at row 1)
-    for row_idx in range(2, len(rows) + 1):
-        row_data = rows[row_idx - 1]
-        
-        # Normalize row length to match headers and ensure we have at least 9 columns
-        target_len = max(9, len(headers))
-        while len(row_data) < target_len:
-            row_data.append('')
+    # Loop through the spreadsheet records
+    for idx, record in enumerate(records):
+        row_idx = idx + 2  # records are 0-indexed, row 1 is header
 
-        # Fetch columns values using the discovered indices (subtract 1 for 0-based array index)
-        task_name = row_data[col_indices["Task Name"] - 1].strip()
-        task_type = row_data[col_indices["Task Type"] - 1].strip()
-        assignee_name = row_data[col_indices["Assignee Name"] - 1].strip()
-        priority = row_data[col_indices["Priority"] - 1].strip()
-        due_date_str = row_data[col_indices["Due Date"] - 1].strip()
-        status = row_data[col_indices["Status"] - 1].strip()
-        slack_id = row_data[col_indices["Slack ID"] - 1].strip()
-        completion_alert = row_data[8].strip()
+        task_name = str(record[key_mapping["Task Name"]]).strip()
+        task_type = str(record[key_mapping["Task Type"]]).strip()
+        assignee_name = str(record[key_mapping["Assignee Name"]]).strip()
+        priority = str(record[key_mapping["Priority"]]).strip()
+        due_date_str = str(record[key_mapping["Due Date"]]).strip()
+        status = str(record[key_mapping["Status"]]).strip()
+        slack_id = str(record[key_mapping["Slack ID"]]).strip()
+        completion_alert = str(record.get(completion_alert_key, "")).strip() if completion_alert_key else ""
 
         # Skip completely empty task name rows
         if not task_name:
@@ -231,9 +236,9 @@ def main():
             )
             send_slack_notification(slack_id, message, slack_bot_token)
 
-            # If Red Priority, schedule the 15-minute Calendar event
-            if priority.lower() == "red":
-                print(f"Task '{task_name}' is Priority RED. Setting up Google Calendar event...")
+            # If Priority is exactly Red, create the Google Calendar event
+            if priority == "Red":
+                print(f"Task '{task_name}' has Priority exactly Red. Setting up Google Calendar event...")
                 create_calendar_event(calendar_service, calendar_id, task_name, assignee_name, slack_id, today)
 
         # 2. Celebration for Done tasks where Completion Alert is not Sent
@@ -253,28 +258,25 @@ def main():
             sh.update_cell(row_idx, 9, "Sent")
             print(f"Marked completion alert as Sent for row {row_idx}")
 
-        # 3. Auto-Rollover for Daily tasks marked Done today (or previously due but completed today)
-        if task_type.lower() == "daily" and status.lower() == "done" and due_date <= today:
-            print(f"Daily task marked Done: '{task_name}'. Executing Rollover...")
+            # If it is a Daily task, roll it over to tomorrow (append a new row) and mark the old row's Status column (7th column) as Archived
+            if task_type.lower() == "daily":
+                new_row_values = []
+                for key in sample_keys:
+                    if key == key_mapping["Due Date"]:
+                        new_row_values.append(tomorrow_str)
+                    elif key == key_mapping["Status"]:
+                        new_row_values.append("Pending")
+                    elif completion_alert_key and key == completion_alert_key:
+                        new_row_values.append("")  # Reset completion alert for the new task
+                    else:
+                        new_row_values.append(str(record.get(key, "")))
 
-            # Construct new row copying attributes, setting tomorrow's date, and status as Pending
-            new_row_values = [""] * len(headers)
-            for col_name, idx in col_indices.items():
-                if col_name == "Due Date":
-                    new_row_values[idx - 1] = tomorrow_str
-                elif col_name == "Status":
-                    new_row_values[idx - 1] = "Pending"
-                else:
-                    new_row_values[idx - 1] = row_data[idx - 1]
+                sh.append_row(new_row_values)
+                print(f"Appended new task rollover for '{task_name}' due on {tomorrow_str}")
 
-            # Append the rollover task to the sheet
-            sh.append_row(new_row_values)
-            print(f"Appended new task rollover for '{task_name}' due on {tomorrow_str}")
-
-            # Archive the old task status
-            status_col_idx = col_indices["Status"]
-            sh.update_cell(row_idx, status_col_idx, "Archived")
-            print(f"Successfully archived original Daily task on row {row_idx}")
+                # Mark the old row's Status column (7th column) as Archived
+                sh.update_cell(row_idx, 7, "Archived")
+                print(f"Successfully archived original Daily task on row {row_idx}")
 
 if __name__ == "__main__":
     main()
