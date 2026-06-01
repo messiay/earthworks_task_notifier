@@ -7,6 +7,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# Configuration
+SLACK_CHANNEL_ID = os.environ['SLACK_CHANNEL_ID']
+
 def get_credentials():
     """
     Parses the service account credentials from the GOOGLE_CREDENTIALS_JSON env variable
@@ -27,46 +30,31 @@ def get_credentials():
     ]
     return service_account.Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
-def send_slack_dm(slack_id, message, token):
+def send_slack_notification(slack_id, message, token):
     """
-    Sends a direct message to a user by their Slack ID.
-    First opens a conversation using conversations.open, then posts the message.
+    Sends a message to the SLACK_CHANNEL_ID and tags the user if slack_id is provided.
     """
-    if not slack_id:
-        print("Skipping Slack DM: No Slack ID provided.")
-        return False
     if not token:
-        print("Skipping Slack DM: No SLACK_BOT_TOKEN provided.")
+        print("Skipping Slack notification: No SLACK_BOT_TOKEN provided.")
         return False
+    if not SLACK_CHANNEL_ID:
+        print("Skipping Slack notification: No SLACK_CHANNEL_ID provided.")
+        return False
+
+    if slack_id:
+        clean_id = slack_id.replace("<@", "").replace(">", "").replace("@", "").strip()
+        if f"<@{clean_id}>" not in message:
+            message = f"<@{clean_id}>\n{message}"
 
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8"
     }
 
-    # Open direct message channel with the user to get a channel ID
-    open_url = "https://slack.com/api/conversations.open"
-    open_payload = {"users": slack_id}
-    
-    channel_id = slack_id
-    try:
-        open_res = requests.post(open_url, json=open_payload, headers=headers, timeout=10)
-        if open_res.status_code == 200:
-            res_json = open_res.json()
-            if res_json.get("ok"):
-                channel_id = res_json["channel"]["id"]
-                print(f"Opened Slack DM channel {channel_id} for user {slack_id}")
-            else:
-                print(f"Warning: conversations.open failed with error: '{res_json.get('error')}'. Falling back to direct user ID.")
-        else:
-            print(f"Warning: conversations.open returned HTTP {open_res.status_code}. Falling back to direct user ID.")
-    except Exception as e:
-        print(f"Warning: Exception trying to open conversation: {e}. Falling back to direct user ID.")
-
     # Post message
     post_url = "https://slack.com/api/chat.postMessage"
     post_payload = {
-        "channel": channel_id,
+        "channel": SLACK_CHANNEL_ID,
         "text": message
     }
     
@@ -81,10 +69,10 @@ def send_slack_dm(slack_id, message, token):
             print(f"Error: Slack API returned error: '{res_json.get('error')}'")
             return False
             
-        print(f"Slack DM successfully sent to {slack_id}")
+        print(f"Slack notification successfully sent to channel {SLACK_CHANNEL_ID}")
         return True
     except Exception as e:
-        print(f"Error: Exception occurred while sending Slack DM: {e}")
+        print(f"Error: Exception occurred while sending Slack notification: {e}")
         return False
 
 def create_calendar_event(calendar_service, calendar_id, task_name, assignee_name, slack_id, today_date):
@@ -202,8 +190,9 @@ def main():
     for row_idx in range(2, len(rows) + 1):
         row_data = rows[row_idx - 1]
         
-        # Normalize row length to match headers
-        while len(row_data) < len(headers):
+        # Normalize row length to match headers and ensure we have at least 9 columns
+        target_len = max(9, len(headers))
+        while len(row_data) < target_len:
             row_data.append('')
 
         # Fetch columns values using the discovered indices (subtract 1 for 0-based array index)
@@ -214,6 +203,7 @@ def main():
         due_date_str = row_data[col_indices["Due Date"] - 1].strip()
         status = row_data[col_indices["Status"] - 1].strip()
         slack_id = row_data[col_indices["Slack ID"] - 1].strip()
+        completion_alert = row_data[8].strip()
 
         # Skip completely empty task name rows
         if not task_name:
@@ -230,7 +220,7 @@ def main():
         if due_date == today and status.lower() == "pending":
             print(f"Found Pending task due today: '{task_name}' (Assignee: {assignee_name})")
             
-            # Send Slack direct message reminder
+            # Send Slack reminder
             message = (
                 f"🔔 *Task Reminder*:\n"
                 f"*Task:* {task_name}\n"
@@ -239,14 +229,31 @@ def main():
                 f"*Priority:* {priority}\n\n"
                 f"Please update the task status in the sheet when completed!"
             )
-            send_slack_dm(slack_id, message, slack_bot_token)
+            send_slack_notification(slack_id, message, slack_bot_token)
 
             # If Red Priority, schedule the 15-minute Calendar event
             if priority.lower() == "red":
                 print(f"Task '{task_name}' is Priority RED. Setting up Google Calendar event...")
                 create_calendar_event(calendar_service, calendar_id, task_name, assignee_name, slack_id, today)
 
-        # 2. Auto-Rollover for Daily tasks marked Done today (or previously due but completed today)
+        # 2. Celebration for Done tasks where Completion Alert is not Sent
+        if status.lower() == "done" and completion_alert.lower() != "sent":
+            print(f"Found completed task: '{task_name}' (Assignee: {assignee_name})")
+            
+            # Send Slack notification celebration
+            clean_id = slack_id.replace("<@", "").replace(">", "").replace("@", "").strip() if slack_id else ""
+            if clean_id:
+                celebration_message = f"🎉 *Task Completed!* Awesome job <@{clean_id}> on completing *{task_name}*!"
+            else:
+                celebration_message = f"🎉 *Task Completed!* Awesome job {assignee_name} on completing *{task_name}*!"
+                
+            send_slack_notification(slack_id, celebration_message, slack_bot_token)
+            
+            # Update the 9th column (Column I) to 'Sent'
+            sh.update_cell(row_idx, 9, "Sent")
+            print(f"Marked completion alert as Sent for row {row_idx}")
+
+        # 3. Auto-Rollover for Daily tasks marked Done today (or previously due but completed today)
         if task_type.lower() == "daily" and status.lower() == "done" and due_date <= today:
             print(f"Daily task marked Done: '{task_name}'. Executing Rollover...")
 

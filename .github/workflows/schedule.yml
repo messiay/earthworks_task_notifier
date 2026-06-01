@@ -32,4 +32,5 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
         run: python notifier.py
