@@ -147,12 +147,11 @@ def main():
     ist = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.datetime.now(ist)
 
-    # The Morning Alarm
+    # The Morning Alarm (broadcast only, do not exit)
     if now_ist.hour == 9:
         print("Morning Alarm: Sending morning broadcast to Slack.")
         message = "🌅 Good morning team! Please make sure your tasks for today are logged in the master sheet."
         send_slack_notification(None, message, slack_bot_token)
-        return
 
     # Authenticate and build services
     print("Authenticating with Google APIs...")
@@ -163,6 +162,26 @@ def main():
     print(f"Opening Google Sheet: {sheet_id}")
     # Using the first sheet tab
     sh = gc.open_by_key(sheet_id).sheet1
+
+    # Check and update headers if needed to ensure we support Column I (9th) and Column J (10th)
+    headers = sh.row_values(1)
+    updated_headers = False
+    while len(headers) < 10:
+        headers.append("")
+        updated_headers = True
+
+    if not headers[8] or headers[8].strip() == "":
+        sh.update_cell(1, 9, "Completion Alert")
+        headers[8] = "Completion Alert"
+        updated_headers = True
+
+    if not headers[9] or headers[9].strip() == "":
+        sh.update_cell(1, 10, "Creation Alert")
+        headers[9] = "Creation Alert"
+        updated_headers = True
+
+    if updated_headers:
+        print("Updated spreadsheet headers for Completion/Creation Alerts.")
     
     # Retrieve all spreadsheet records
     records = sh.get_all_records()
@@ -190,6 +209,7 @@ def main():
         key_mapping[req] = match
 
     completion_alert_key = sample_keys[8] if len(sample_keys) >= 9 else None
+    creation_alert_key = sample_keys[9] if len(sample_keys) >= 10 else None
 
     today = now_ist.date()
     today_str = today.strftime("%Y-%m-%d")
@@ -209,6 +229,7 @@ def main():
         status = str(record[key_mapping["Status"]]).strip()
         slack_id = str(record[key_mapping["Slack ID"]]).strip()
         completion_alert = str(record.get(completion_alert_key, "")).strip() if completion_alert_key else ""
+        creation_alert = str(record.get(creation_alert_key, "")).strip() if creation_alert_key else ""
 
         # Skip completely empty task name rows
         if not task_name:
@@ -221,8 +242,35 @@ def main():
             print(f"Skipping row {row_idx}: Invalid date format '{due_date_str}' for task '{task_name}'. Expected YYYY-MM-DD.")
             continue
 
-        # 1. Send reminders for tasks due today that are Pending
-        if due_date == today and status.lower() == "pending":
+        # 1. New Task Alert (Creation Alert) - runs no matter the time
+        new_task_notified = False
+        if creation_alert.lower() != "sent":
+            print(f"Found new task: '{task_name}' (Assignee: {assignee_name})")
+            clean_id = slack_id.replace("<@", "").replace(">", "").replace("@", "").strip() if slack_id else ""
+            if clean_id:
+                creation_message = (
+                    f"🆕 *New Task Added!*\n"
+                    f"*Task:* {task_name}\n"
+                    f"*Assignee:* <@{clean_id}>\n"
+                    f"*Due Date:* {due_date_str}\n"
+                    f"*Priority:* {priority}"
+                )
+            else:
+                creation_message = (
+                    f"🆕 *New Task Added!*\n"
+                    f"*Task:* {task_name}\n"
+                    f"*Assignee:* {assignee_name}\n"
+                    f"*Due Date:* {due_date_str}\n"
+                    f"*Priority:* {priority}"
+                )
+            send_slack_notification(slack_id, creation_message, slack_bot_token)
+            sh.update_cell(row_idx, 10, "Sent")
+            print(f"Marked creation alert as Sent for row {row_idx}")
+            creation_alert = "Sent"
+            new_task_notified = True
+
+        # 2. Send reminders for tasks due today that are Pending (skip if just notified of creation)
+        if due_date == today and status.lower() == "pending" and not new_task_notified:
             print(f"Found Pending task due today: '{task_name}' (Assignee: {assignee_name})")
             
             # Send Slack reminder
@@ -241,7 +289,7 @@ def main():
                 print(f"Task '{task_name}' has Priority exactly Red. Setting up Google Calendar event...")
                 create_calendar_event(calendar_service, calendar_id, task_name, assignee_name, slack_id, today)
 
-        # 2. Celebration for Done tasks where Completion Alert is not Sent
+        # 3. Celebration for Done tasks where Completion Alert is not Sent
         if status.lower() == "done" and completion_alert.lower() != "sent":
             print(f"Found completed task: '{task_name}' (Assignee: {assignee_name})")
             
@@ -268,6 +316,8 @@ def main():
                         new_row_values.append("Pending")
                     elif completion_alert_key and key == completion_alert_key:
                         new_row_values.append("")  # Reset completion alert for the new task
+                    elif creation_alert_key and key == creation_alert_key:
+                        new_row_values.append("")  # Reset creation alert for the new task
                     else:
                         new_row_values.append(str(record.get(key, "")))
 
